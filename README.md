@@ -4,3 +4,8 @@
 [![GitHub license](https://img.shields.io/github/license/Natooz/MidiTok.svg)](https://github.com/Natooz/MidiTok/blob/main/LICENSE)
 
 A library for simulating the guitar playing and choosing the right finger and fret positions.
+
+## Todo
+- [ ] Write test functions.
+  - [ ] Try to find more edge cases and handle them.
+- [ ] Develop an UI for visualization.
