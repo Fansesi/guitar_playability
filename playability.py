@@ -1,7 +1,8 @@
 from pretty_midi import PrettyMIDI
-from typing import List, Dict, Union, Tuple
+from typing import List, Dict, Optional, Union, Any, Tuple
 from loguru import logger as lg
-from pathlib import Path
+from copy import deepcopy
+from pathlib import Path, PosixPath
 import numpy as np
 
 
@@ -11,34 +12,43 @@ class Playability:
         MIDIFile: Union[PrettyMIDI, Union[str, Path]],
         fret_threshold: int = 4,
         hand_threshold: int = 5,
-        error_distubution: Tuple[float, float, float, float] = (
+        speed_threshold: float = 12 / 0.01,  # 12 frets / 10 ms
+        error_distrubution: Tuple[float, float, float, float, float] = (
             0.3,
             0.3,
             0.2,
             0.1,
-            0.1,
+            0.05,
+            0.05,
         ),
         transpose: bool = True,
     ) -> None:
         """Simulating hand positions while playing a 6 stringed (at the moment), normal tuning (at the moment) guitar.
-        @Params
-        @MIDIFile: a PrettyMIDI object or a path of the .mid file to process.
 
-        @threshold: maximum length of the notes apart in frets numbers. Although it depends on the position, a skilled player can
-        play notes that are 5 frets apart but in order to be more calculate the score more generally, threshold is set to 4.
+        Params
+        ---
+        * `MIDIFile`: a PrettyMIDI object or a path of the .mid file to process.
 
-        @hand_threshold: max fret number that a hand can move between two different shapes between two time steps. Default to 5.
+        * `fret_threshold`: maximum length of the notes apart in frets numbers. Although it depends on
+        the position, a skilled player can play notes that are 5 frets apart but in order to
+        be more calculate the score more generally, threshold is set to 4.
 
-        @error_distribution: (a,b,c,d,e) where a is for fret_error, b is for hand_error, c is for max_min_pitch error,
+        * `hand_threshold`: max fret number that a hand can move between two different shapes between two time steps. Default to 5.
+
+        * `speed_threshold`: max speed of hand in fret/sec.
+
+        * `error_distribution`: (a,b,c,d,e,f) where a is for fret_error, b is for hand_error, c is for max_min_pitch error,
         d is for max 6 playable strings error and e is for impossible to play (some edgy cases where it looks like it's possible to play
-        but in fact it's not.) error.
+        but in fact it's not.) error, f is for speed error.
 
-        @transpose: whether to transpose the pitches that doesn't fall into the possible pitch range. If set to True, will transpose
+        * `transpose`: whether to transpose the pitches that doesn't fall into the possible pitch range. If set to True, will transpose
         the notes into the nearest octave. If set to false, will remove those notes. In both cases the error rate will be calculated.
 
         In this implementation time_step indicates the begining of each note that have different start times.
         """
-        # Todo: write a function that can produce the above result. With such function, we'll be able to change tuning as well.
+        # I know its just a lot of labor but I'm too lazy to write the code for this.
+        # With this kind of implementation it's impossible to change the tuning of the guitar unfortunately.
+        # That's a TODO for later though.
         self.guitar_fretboard = {
             40: [0, -1, -1, -1, -1, -1],  # E2
             41: [1, -1, -1, -1, -1, -1],
@@ -96,15 +106,28 @@ class Playability:
         if hand_threshold <= 0:
             lg.critical("Hand threshold can't be 0 or negative")
             raise Exception
+        if len(error_distrubution) != 6:
+            lg.critical(
+                f"Currently there are 6 different error rates. But you have given {len(error_distrubution)} many error distribution."
+            )
+            raise
+        if sum(error_distrubution) != 1:
+            lg.warning(
+                f"Sum of error distrubution should probably be 1 but it's {sum(error_distrubution)}"
+            )
 
         self.midi_file = (
-            PrettyMIDI(MIDIFile) if isinstance(MIDIFile, (str, Path)) else MIDIFile
+            PrettyMIDI(str(MIDIFile))
+            if isinstance(MIDIFile, (str, Path, PosixPath))
+            else MIDIFile
         )
         self.fret_threshold = fret_threshold
         self.hand_threshold = hand_threshold
+        self.speed_threshold = speed_threshold
 
         self.hand_threshold_error = 0
         self.fret_threshold_error = 0
+        self.speed_threshold_error = 0
         self.impossible_to_play = 0
 
         # times steps to look at each iteration.
@@ -135,36 +158,44 @@ class Playability:
         # hand position for each time step. It's calculated as the average of the farthest notes
         self.hand_position = [-1.0]
 
-        # [[[1,2],[2,5],[4,2]], [[1,2],[2,4],[3,2]]] wholesong[timesteps[pitches]].
-        # self.note_locations_A = []
-
         # Another approach could be like this: [[2, -1, -1, 3, 2, 0], [0, -1, -1, 2, 4, 2], ...] wholesong[timesteps[_,_,_,_,_,_]]
         self.time_note_locations = self.iterate_notes(self.cleaned_times_pitches)
         # lg.info(f"time_note_locations: {self.time_note_locations}")
-        # itprint(self.time_note_locations)
-        # itprint(self.time_note_locations[824])
 
-        # self.playability = ((1-(((error_distubution[0] * self.fret_threshold_error) + (error_distubution[1] * self.hand_threshold_error) + (error_distubution[2] * self.))/len(self.cleaned_times_pitches)))) * 100
+        # post process the hand_positions
+        self._post_process_hand_positions()
+
+        # calculating the hand velocities and error rate of it.
+        self.hand_velocities = self.calculate_speed()
+        self.calculate_speed_error()
+
+        # self.playability = ((1-(((error_distrubution[0] * self.fret_threshold_error) + (error_distrubution[1] * self.hand_threshold_error) + (error_distrubution[2] * self.))/len(self.cleaned_times_pitches)))) * 100
+        # TODO: write this nicely
         self.playability_rate = (
             100
             - (
-                self.pitch_error * error_distubution[2]
-                + self.six_error * error_distubution[3]
+                self.pitch_error * error_distrubution[2]
+                + self.six_error * error_distrubution[3]
             )
             - (
                 100
-                * error_distubution[0]
+                * error_distrubution[0]
                 * (self.fret_threshold_error / len(self.time_note_locations))
             )
             - (
                 100
-                * error_distubution[1]
+                * error_distrubution[1]
                 * (self.hand_threshold_error / len(self.time_note_locations))
             )
             - (
                 100
-                * error_distubution[4]
+                * error_distrubution[4]
                 * (self.impossible_to_play / len(self.time_note_locations))
+            )
+            - (
+                100
+                * error_distrubution[5]
+                * (self.speed_threshold_error / len(self.time_note_locations))
             )
         )
 
@@ -208,12 +239,6 @@ class Playability:
         # E.g. :{(start, min_0): [65,71], (min_1, min_2): [34, 7, 8, 9]]}
         return min_intervals
 
-    def create_time_steps(self, obj: PrettyMIDI):
-        """Creates the time steps using pretty_midi.Notes.start.
-        DEPRECIATED.
-        """
-        raise NotImplementedError
-
     def iterate_notes(self, times_pitches_param: Dict[Tuple[float, float], List[int]]):
         """'Big brain algorithm...'
         1. Create all the possible permutations of guitar positions with the given pitch values.
@@ -224,6 +249,26 @@ class Playability:
         5. Update the note_locations and hand_position.
         6. Return max distance for playability_score() to use.
         """
+        # lg.info("Big brain time...")
+
+        # all_pos = [] #List[ List[ List[ List[] position_0, List[] position_1, ...  ] pitch_0, List[ List[] position_0, List[] position_1, ...  ] pitch_1   ](time_step)   ]
+        # 4 nested list in total
+        # [
+        #   [
+        #     48: [[],[], ...],
+        #     56: [[],[], ...],  vertical dots don't need to be the same length.
+        #     70: [[],[], ...],
+        #     ...
+        #     max 6
+        #   ], #this is the first time step
+        #   [
+        #     48: [[],[], ...],
+        #     56: [[],[], ...],  vertical dots don't need to be the same length.
+        #     70: [[],[], ...],
+        #     ...
+        #     max 6
+        #   ] #this is the secondtime step
+        # ]
 
         time_bestlocs_dict = times_pitches_param.copy()
         for i in range(len(times_pitches_param.values())):
@@ -253,6 +298,15 @@ class Playability:
                         notes = np.unique(notes)
                         merged_lists = self._create_possible_places(notes)
 
+                # self.merge_lists(container_list)[0] because given multiple lists end up being just one list in a list.
+                # We don't need that dimension no more. (1,n,m) => (n,m).
+
+                # Debugger
+                # lg.debug(f"New new notes: {notes}")
+                # print("Container: ", container_list)
+                # print("Merged list: ", self.merge_lists(container_list)[0])
+                # print()
+
                 time_bestlocs_dict[list(time_bestlocs_dict.keys())[i]] = self.L2(
                     merged_lists
                 )
@@ -270,10 +324,10 @@ class Playability:
         container_list: [[[7, -1, -1, -1, -1, -1], [-1, 2, -1, -1, -1, -1]], [[7, -1, -1, -1, -1, -1], [-1, 2, -1, -1, -1, -1]], [[7, -1, -1, -1, -1, -1], [-1, 2, -1, -1, -1, -1]]]
         self.merge_lists(container_list)[0]: []
 
-        3 notes, 2 possibilities; all iterations fails at _check_occurence()."""
-        # To catch the mention error.
-        # If this happens, we are going to discard minimum amount of octaves from the notes
-        # and return the possible ones.
+        3 notes, 2 possibilities; all iterations fails at _check_occurence().
+        To catch the mention error.
+        If this happens, we are going to discard minimum amount of octaves from the notes
+        and return the possible ones."""
 
         # lg.debug("Handling an edge case...")
         temp_dict: Dict[int, Tuple[int, int]] = {}
@@ -335,6 +389,16 @@ class Playability:
         #    if j != -1:
         #        n+=1
         indices, elements = self.retr_indexes_elems(pitch_repr)
+
+        # Below does the same job but the new implementation is better
+        # for pitch in pitch_repr:
+        #    if pitch != -1:
+        #        base_repr_copy = base_repr.copy()
+        #        base_repr_copy.pop(pitch_repr.index(pitch))
+        #        base_repr_copy.insert(pitch_repr.index(pitch),pitch)
+        #        final_list.append(base_repr_copy)
+        #    else:
+        #        continue
 
         for i in range(len(indices)):
             base_repr_copy = base_repr.copy()
@@ -452,7 +516,15 @@ class Playability:
             )  # Our hand position stays the same at this time_step
         else:
             indices, elements = self.retr_indexes_elems(pos)
-            self.hand_position.append((min(elements) + max(elements)) / 2)
+            # Here if the min element of the hand position is 0 we don't consider that.
+            # But if it's all open string, we keep the same hand position.
+            if all(num == 0 for num in elements):
+                self.hand_position.append(self.hand_position[-1])
+            else:
+                # Too lazy to write a function for this. Numpy does it great!
+                elements = np.array(elements)
+                nonzero_min = np.min(elements[np.nonzero(elements)])
+                self.hand_position.append((nonzero_min + max(elements)) / 2)
 
     def _maxmin_nonzero(self, a_list: List[int]):
         """Returns the max and min elements which are nonzero of a list respectively."""
@@ -490,7 +562,7 @@ class Playability:
         of the neck.
 
         Edge Case 2: Well it's not an edge case, I've just missed it somehow! We don't need to consider open strings because we can play
-        them everywhere. So open strings shouldn't be considered while looking at min and max
+        them everywhere. So open strings shouldn't be considered while looking at min and max.
 
         I'm taking the 'open string first' approach. If it's possible to play the open string, we'll just play that.
         This is practically bad becuase you might lose sustain but it can played like this and it's not an error.
@@ -499,7 +571,7 @@ class Playability:
 
         if pos == []:
             # Todo: try to catch every edge case.
-            # lg.error("Well, pos=[] again...")
+            lg.error("Well, pos=[] again...")
             self._update_threshold_errors(impossible=True)
             self.update_hand_pos([], True)
             return []
@@ -512,7 +584,7 @@ class Playability:
         # if it's only on open strings just play it. 'open strings first' approach
         for position in pos:
             if self._all_zeros(position):
-                # lg.debug(f"Open strings first: {position}")
+                lg.debug(f"Open strings first: {position}")
                 self.update_hand_pos(pos=[], is_rest=True)
                 return position
 
@@ -542,6 +614,15 @@ class Playability:
             if elem == min(note_distances):
                 min_dist_indices.append(index)
 
+        # there is no previous hand position, just take the min note distance
+        # 13.08.23 Update: This doesn't seem to be effective. I'm changing it.
+        # if self.hand_position == [-1]:
+        #    self.update_hand_pos(pos[min_dist_indices[0]])
+        #    return pos[min_dist_indices[0]]
+
+        # 13.08.23 Update: Here I'll focus on being at the beginning of the fretboard
+        # rather than being two notes close to each other. Because later on
+        # we are having problems with being too down on the neck.
         if self.hand_position == [-1]:
             min_hand_index = possible_hand_positions.index(min(possible_hand_positions))
             self.update_hand_pos(pos[min_hand_index])
@@ -589,37 +670,43 @@ class Playability:
             self.update_hand_pos(pos[min_hand_index])
             return pos[min_hand_index]
 
-    def _update_threshold_errors(self, fret=False, hand=False, impossible=False):
+    def _update_threshold_errors(
+        self, fret=False, hand=False, impossible=False, speed=False
+    ):
         if fret == True:
             self.fret_threshold_error += 1
         if hand == True:
             self.hand_threshold_error += 1
         if impossible == True:
             self.impossible_to_play += 1
+        if speed == True:
+            self.speed_threshold_error += 1
 
     def return_six_error(
         self, times_pitches: Dict[Tuple[float, float], List[int]]
     ) -> Tuple[Dict[Tuple[float, float], List[int]], float]:
-        """Return the error rate of the file if such error exists. It is the same as the playability
+        """Return the error rate of max-6-notes if such error exists. It is the same as the playability
         function that I've already implemented.
         Returns the playability rate if there are errors otherwise 100."""
         times_pitches_copy = times_pitches.copy()
         time_error = 0
 
         for i in range(len(times_pitches_copy)):
-            if (
-                len(list(times_pitches_copy.values())[i]) > 6
-            ):  # Guitar's maxiumum string number is set to 6. (Not creating a variable for that rn.)
-                time_error += (
-                    list(times_pitches_copy.keys())[i][1]
-                    - list(times_pitches_copy.keys())[i][0]
-                )
-                # lg.debug("Removing some from soo many notes")
-                times_pitches_copy[list(times_pitches_copy.keys())[i]] = sorted(
-                    list(times_pitches_copy.values())[i], reverse=True
-                )[:5]
-                # Todo: definetelly change this. You amy remove the octaves (duplicate notes) maybe but not all the bass notes.
-                # if there are more than 6, remove the bass part as much as needed.
+            time_start_end = list(times_pitches_copy.keys())[i]
+            pitch_values = list(times_pitches_copy.values())[i]
+
+            if len(pitch_values) > 6:
+                # Guitar's maxiumum string number is set to 6. (Not creating a variable for that rn.)
+                time_error += time_start_end[1] - time_start_end[0]
+
+                # Removing duplicates
+                times_pitches_copy[time_start_end] = list(dict.fromkeys(pitch_values))
+
+                # If the problem persists, take the highest pitches.
+                if len(times_pitches_copy[time_start_end]) > 6:
+                    times_pitches_copy[time_start_end] = sorted(
+                        times_pitches_copy[time_start_end], reverse=True
+                    )[:5]
 
         return times_pitches_copy, (time_error / len(times_pitches)) * 100
 
@@ -634,6 +721,12 @@ class Playability:
         3) Return an error rate of it."""
 
         cleaned_times_pitches = times_pitches.copy()
+
+        # for t, notes in times_pitches.keys(), times_pitches.values():
+        #    notes_cleaned = notes.copy()
+        #    for pitch in notes:
+        #        if pitch > self.MAX_PITCH or pitch < self.MIN_PITCH:
+        #            notes_cleaned.remove(pitch)
 
         err = 0
         total_notes = 0
@@ -716,11 +809,17 @@ class Playability:
 
         return (tranposed_times_pitches, (manipulation_num / total_notes) * 100, note_D)
 
-    def show_stats(self, hand: bool = False, time_step: bool = False) -> None:
+    def show_stats(
+        self, hand: bool = False, time_step: bool = False, vel: bool = False
+    ) -> None:
         if time_step:
             lg.info("self.time_note_locations data is:")
+            for i in self.time_note_locations:
+                print(i)
         if hand:
             lg.info(f"Hand position data is: \n{self.hand_position}")
+        if vel:
+            lg.info(f"Hand velocity data is: \n{self.hand_velocities}")
         lg.info(
             "Statistics"
             + f"\nPlayability rate: {self.playability_rate}, \n"
@@ -728,5 +827,212 @@ class Playability:
             + f"Hand Position Error: {self.hand_threshold_error}, \n"
             + f"Pitch Interval Error: {self.pitch_error}, \n"
             + f"Max 6 String Error: {self.six_error}, \n"
-            + f"Impossible to Play Error: {self.impossible_to_play}"
+            + f"Impossible to Play Error: {self.impossible_to_play}, \n"
+            + f"Hand Speed Error: {self.speed_threshold_error}"
         )
+
+    def visualize_song(self) -> None:
+        """Visualizes the song on classical guitar fretboard using self.time_note_locations and self.hand_position.
+        Here we are considering the time with a slider.
+
+        Buttons
+        ---
+        * Reset button resets the slider to 0.
+        * Auto Scroll button starts from the current time_position and goes on from there.
+
+        Keyboard Inputs
+        ---
+        * rightarrow: increase the slider val.
+        * leftarrow: decrease the slider val.
+        * a: break the auto scroll."""
+
+        import matplotlib.pyplot as plt
+        from matplotlib.figure import Figure
+        from matplotlib.axis import Axis
+        from matplotlib.widgets import Slider, Button
+        import math
+        import time
+
+        def create_grid(ax: plt.Axes, num_frets, num_strings):
+            """Creates the strings, frets in order words the grid."""
+            for num in num_frets:
+                ax.plot(
+                    [num] * len(num_strings), num_strings, linewidth=1, color="black"
+                )
+
+            for num in num_strings:
+                ax.plot(num_frets, [num] * len(num_frets), linewidth=1, color="black")
+
+            return ax
+
+        def arange_hand_position(index: int, num_strings: List[int]):
+            """Given an index returns the hand_position of that index."""
+            return [self.hand_position[index]] * len(num_strings), num_strings
+
+        def return_fret_positions(fret_pos: List[int]):
+            """Ex fret_pos: [0, -1, 5, -1, 3, 0]"""
+            # (x,y) values on the graph
+            x = []
+            y = []
+            lg.trace(fret_pos)
+            for i, elem in enumerate(fret_pos):
+                if elem != -1:
+                    x.append(elem)
+                    y.append(i)
+            return x, y
+
+        num_frets = np.arange(22)  # y
+        num_strings = np.arange(6)  # x
+
+        # Define initial parameters
+        initial_time_step = list(self.time_note_locations.keys())[0]
+        lg.debug(initial_time_step)
+        # Create the figure and the line that we will manipulate
+        fig, ax = plt.subplots()
+
+        # Labeling the axes
+        ax.set_xlabel("Frets")
+        ax.set_ylabel("Strings")
+
+        # Creating the guitar fretboard
+        ax = create_grid(ax, num_frets.tolist(), num_strings.tolist())
+
+        # Creating the graph with inital data.
+        note_positions_line = ax.plot(
+            [],  # initially empty
+            "bo",
+            markersize=6,
+        )
+
+        hand_positions_line = ax.plot(
+            [],  # initially empty
+            linewidth=4,
+            color="red",
+        )
+
+        # Adjust the main plot to make room for the sliders
+        fig.subplots_adjust(bottom=0.25)
+
+        # Make a vertically oriented slider to control the amplitude
+        ax_time = fig.add_axes([0.25, 0.1, 0.65, 0.03])
+
+        time_step_slider = Slider(
+            ax=ax_time,
+            label="Time Step",
+            valmin=0,
+            valmax=len(self.time_note_locations),
+            valinit=0,
+            orientation="horizontal",
+        )
+
+        # The function to be called anytime a slider's value changes
+        def update(val):
+            int_val = math.floor(val)
+            note_positions_line[0].set_data(
+                return_fret_positions(list(self.time_note_locations.values())[int_val])
+            )
+            hand_positions_line[0].set_data(
+                arange_hand_position(int_val + 1, num_strings.tolist())
+            )
+            fig.canvas.draw_idle()
+
+        # # register the update function with each slider
+        time_step_slider.on_changed(update)
+
+        # Create a `matplotlib.widgets.Button` to reset the sliders to initial values.
+        resetax = fig.add_axes([0.8, 0.025, 0.1, 0.05])
+        reset_button = Button(resetax, "Reset", hovercolor="0.975")
+
+        autoax = fig.add_axes([0.6, 0.025, 0.13, 0.05])
+        auto_button = Button(autoax, "Auto Scroll", hovercolor="0.975")
+
+        self.__stop_data = False
+
+        def reset(event):
+            time_step_slider.reset()
+            fig.canvas.flush_events()
+
+        def auto_scroll(event):
+            for i in range(time_step_slider.val, len(self.time_note_locations)):
+                # I know it's ugly but it's the way to go.
+                time_duration = (
+                    list(self.time_note_locations.keys())[i][1]
+                    - list(self.time_note_locations.keys())[i][0]
+                )
+                time_step_slider.set_val(i)
+                plt.pause(time_duration)
+                if self.__stop_data:
+                    break
+            self.__stop_data = False
+
+        def onkey(event):
+            lg.debug(event)
+            if event.key == "right":
+                time_step_slider.set_val(time_step_slider.val + 1)
+            if event.key == "left":
+                time_step_slider.set_val(time_step_slider.val - 1)
+            if event.key == "a":
+                self.__stop_data = True
+            fig.canvas.draw()
+
+        reset_button.on_clicked(reset)
+        auto_button.on_clicked(auto_scroll)
+        fig.canvas.mpl_connect("key_press_event", onkey)
+
+        plt.show()
+
+    def _post_process_hand_positions(self) -> None:
+        """After calculating all the `self.hand_positions` and `self.time_note_locations`, we can set the hand position of rests
+        to be inbetween the previous and next hand positions. Moving the hand while waiting.
+        """
+        # removing the first element (which is -1) here.
+        hand_positions = deepcopy(self.hand_position[1:])
+
+        # getting the rest indices.
+        rest_indices = []
+        for i, note_locations in enumerate(list(self.time_note_locations.values())):
+            if note_locations == []:
+                rest_indices.append(i)
+
+        # we can't modify the first and the last.
+        if rest_indices[0] == 0:
+            rest_indices.pop(0)
+        if rest_indices[-1] == len(self.time_note_locations):
+            rest_indices.pop(-1)
+
+        for index in rest_indices:
+            hand_positions[index] = (
+                hand_positions[index + 1] + hand_positions[index - 1]
+            ) / 2
+
+        hand_positions.insert(0, -1)
+        self.hand_position = hand_positions
+
+    def calculate_speed(self) -> List[float]:
+        """Calculates the speed of hand while moving from position to position. Uses `self.hand_position`,
+        `self.time_note_locations`
+        :Returns:
+        A list containing the fret/sec of each inbetween-time-step (i and i+1 i=0,1,...)
+        """
+        velocities = []
+        for i in range(1, len(self.hand_position) - 1):
+            # I hate to access these like this but it's the way to go.
+            duration_between_pos = (
+                list(self.time_note_locations.keys())[i][0]
+                - list(self.time_note_locations.keys())[i - 1][1]
+            )
+            if duration_between_pos == 0:
+                duration_between_pos = 0.1  # 0.1 sec = 100 ms
+            velocities.append(
+                abs(self.hand_position[i] - self.hand_position[i + 1])
+                / duration_between_pos
+            )
+
+        return velocities
+
+    def calculate_speed_error(self):
+        """Calculates the speed error using `self.hand_velocities`"""
+
+        for vel in self.hand_velocities:
+            if vel > self.speed_threshold:
+                self._update_threshold_errors(speed=True)
